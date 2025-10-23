@@ -1,7 +1,7 @@
 # Multi-stage Dockerfile for eBPF Agent
 
 # Stage 1: Build environment with eBPF toolchain
-FROM ubuntu:22.04 AS builder
+FROM --platform=linux/amd64 ubuntu:22.04 AS builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
@@ -11,8 +11,12 @@ RUN apt-get update && apt-get install -y \
     make \
     git \
     libbpf-dev \
+    linux-libc-dev \
     linux-headers-generic \
     && rm -rf /var/lib/apt/lists/*
+
+# Create symlink for asm headers (architecture-specific)
+RUN ln -sf /usr/include/x86_64-linux-gnu/asm /usr/include/asm
 
 # Set up Go environment
 ENV PATH="/usr/lib/go-1.21/bin:${PATH}"
@@ -36,7 +40,7 @@ RUN go generate ./...
 RUN go build -o ebpf-agent .
 
 # Stage 2: Runtime environment (minimal)
-FROM ubuntu:22.04
+FROM --platform=linux/amd64 ubuntu:22.04
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \

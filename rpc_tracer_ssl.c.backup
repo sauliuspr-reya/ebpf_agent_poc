@@ -1,0 +1,73 @@
+//go:build ignore
+
+#include <linux/bpf.h>
+#include <linux/ptrace.h>
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_tracing.h>
+
+// Trace HTTPS JSON-RPC traffic by intercepting SSL_write/SSL_read
+// This works for Node.js, Python, any app using OpenSSL
+
+#define TASK_COMM_LEN 16
+#define MAX_PAYLOAD_SIZE 256  // Reduced to fit in BPF stack (512 byte limit)
+
+struct ssl_event_t {
+    __u64 pid;
+    __u64 timestamp_ns;
+    __u32 data_len;
+    __u32 is_write;  // 1 = request (SSL_write), 0 = response (SSL_read)
+    char comm[TASK_COMM_LEN];
+    char payload[MAX_PAYLOAD_SIZE];  // Partial JSON-RPC payload
+};
+
+// Perf buffer for events
+struct {
+    __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+    __uint(key_size, sizeof(__u32));
+    __uint(value_size, sizeof(__u32));
+} events SEC(".maps");
+
+// Uprobe on SSL_write (outgoing HTTPS requests)
+SEC("uprobe/SSL_write")
+int trace_ssl_write(struct pt_regs *ctx) {
+    struct ssl_event_t event = {};
+    
+    // Get PID and timestamp
+    __u64 id = bpf_get_current_pid_tgid();
+    event.pid = id >> 32;
+    event.timestamp_ns = bpf_ktime_get_ns();
+    event.is_write = 1;
+    
+    // Get process name
+    bpf_get_current_comm(&event.comm, sizeof(event.comm));
+    
+    // SSL_write(SSL *ssl, const void *buf, int num)
+    // buf is in PT_REGS_PARM2, num is in PT_REGS_PARM3
+    void *buf = (void *)PT_REGS_PARM2(ctx);
+    int len = (int)PT_REGS_PARM3(ctx);
+    
+    // Validate length is positive and reasonable
+    if (len <= 0 || len > 65536) {
+        return 0;  // Skip invalid sizes
+    }
+    
+    event.data_len = len;
+    
+    // Read partial payload to detect JSON-RPC method
+    // Ensure read_size is within bounds for BPF verifier
+    __u32 read_size = len < MAX_PAYLOAD_SIZE ? len : MAX_PAYLOAD_SIZE;
+    if (read_size > 0 && read_size <= MAX_PAYLOAD_SIZE) {
+        bpf_probe_read_user(&event.payload, read_size & (MAX_PAYLOAD_SIZE - 1), buf);
+    }
+    
+    // Send to userspace
+    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &event, sizeof(event));
+    
+    return 0;
+}
+
+// Note: SSL_read tracing disabled for now
+// Capturing responses requires more complex tracking (storing buffer pointers in maps)
+// For MVP, we only capture outgoing requests (SSL_write)
+
+char LICENSE[] SEC("license") = "GPL";

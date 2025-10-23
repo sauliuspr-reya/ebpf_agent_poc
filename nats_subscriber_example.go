@@ -12,6 +12,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -57,9 +58,9 @@ func main() {
 		}
 
 		// Pretty print the feature
-		fmt.Println("\n" + "="*80)
+		fmt.Println("\n" + strings.Repeat("=", 80))
 		fmt.Printf("📊 New Event Received\n")
-		fmt.Println("-" * 80)
+		fmt.Println(strings.Repeat("-", 80))
 		fmt.Printf("Subject:      %s\n", msg.Subject)
 		fmt.Printf("App ID:       %s\n", feature.AppID)
 		fmt.Printf("Protocol:     %s\n", feature.Protocol)
@@ -71,7 +72,7 @@ func main() {
 		for key, value := range feature.Details {
 			fmt.Printf("  - %s: %v\n", key, value)
 		}
-		fmt.Println("=" * 80)
+		fmt.Println(strings.Repeat("=", 80))
 	})
 
 	if err != nil {

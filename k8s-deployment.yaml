@@ -1,28 +1,22 @@
 ---
 apiVersion: v1
-kind: Namespace
-metadata:
-  name: monitoring
-
----
-apiVersion: v1
 kind: ConfigMap
 metadata:
   name: ebpf-agent-config
-  namespace: monitoring
+  namespace: nats
 data:
-  NATS_URL: "nats://nats-service.monitoring.svc.cluster.local:4222"
-  APP_ID: "arbitrum-node-service"
-  TARGET_BINARY: "/usr/local/bin/geth"
-  TARGET_SYMBOL: "github.com/ethereum/go-ethereum/rpc.(*Server).serveRequest"
-  TARGET_PID: "0"
+  NATS_URL: "nats://nats.nats.svc.cluster.local:4222"
+  APP_ID: "testnet-rpc-monitor"
+  # Kernel-level network tracing (captures ALL TCP traffic from Node.js)
+  # No TARGET_BINARY/TARGET_SYMBOL needed - uses kprobes on tcp_sendmsg
+  DEBUG: "true"  # Enable verbose debug logging
 
 ---
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
   name: ebpf-agent
-  namespace: monitoring
+  namespace: nats
   labels:
     app: ebpf-agent
 spec:
@@ -35,12 +29,19 @@ spec:
         app: ebpf-agent
     spec:
       hostPID: true
-      hostNetwork: true
+      # hostNetwork: true  # Disabled to allow cluster DNS resolution
       serviceAccountName: ebpf-agent
+      # Allow running on spot nodes (where oracle pods run)
+      tolerations:
+      - key: cloud.google.com/gke-spot
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
       containers:
       - name: ebpf-agent
-        image: ebpf-agent:latest
-        imagePullPolicy: IfNotPresent
+        # Update this to your GCR image: gcr.io/testnet-473109/ebpf-agent:latest
+        image: gcr.io/testnet-473109/ebpf-agent:latest
+        imagePullPolicy: Always
         securityContext:
           privileged: true
           capabilities:
@@ -87,7 +88,7 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: ebpf-agent
-  namespace: monitoring
+  namespace: nats
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -111,54 +112,4 @@ roleRef:
 subjects:
 - kind: ServiceAccount
   name: ebpf-agent
-  namespace: monitoring
-
----
-# NATS Server Deployment (for testing)
-apiVersion: v1
-kind: Service
-metadata:
-  name: nats-service
-  namespace: monitoring
-spec:
-  selector:
-    app: nats
-  ports:
-  - port: 4222
-    targetPort: 4222
-    name: client
-  - port: 8222
-    targetPort: 8222
-    name: monitoring
-
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: nats
-  namespace: monitoring
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: nats
-  template:
-    metadata:
-      labels:
-        app: nats
-    spec:
-      containers:
-      - name: nats
-        image: nats:latest
-        ports:
-        - containerPort: 4222
-          name: client
-        - containerPort: 8222
-          name: monitoring
-        resources:
-          requests:
-            memory: "64Mi"
-            cpu: "100m"
-          limits:
-            memory: "256Mi"
-            cpu: "500m"
+  namespace: nats

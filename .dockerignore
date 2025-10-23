@@ -1,0 +1,25 @@
+# Exclude from Docker build context
+.git
+.gitignore
+*.md
+!README.md
+Makefile
+docker-compose.yaml
+.DS_Store
+
+# Exclude subscriber (separate tool, not part of agent)
+nats_subscriber_example.go
+Dockerfile.subscriber
+
+# Exclude generated files (will be regenerated)
+*_bpf*.go
+*_bpf*.o
+
+# Exclude scripts
+scripts/
+
+# Exclude test files
+*_test.go
+
+# Exclude K8s manifests
+k8s-deployment.yaml

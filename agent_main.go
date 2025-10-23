@@ -8,13 +8,15 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
+	"regexp"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
-	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/perf"
 	"github.com/cilium/ebpf/rlimit"
@@ -28,9 +30,10 @@ var (
 	TargetBinary    = getEnv("TARGET_BINARY", "/usr/local/bin/geth")
 	TargetSymbolRet = getEnv("TARGET_SYMBOL", "github.com/ethereum/go-ethereum/rpc.(*Server).serveRequest")
 	TargetPID       = getEnvInt("TARGET_PID", 0) // 0 means attach to all processes
+	DebugMode       = getEnv("DEBUG", "false") == "true"
 )
 
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang rpc rpc_tracer.c -- -I./headers
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -target bpfel rpc rpc_tracer.c -- -D__TARGET_ARCH_x86 -I/usr/include/x86_64-linux-gnu
 
 // Agent holds the core components for the tracing service.
 type Agent struct {
@@ -43,13 +46,16 @@ type Agent struct {
 }
 
 // RPCEvent represents data sent from the BPF program to the Go User-Space Agent.
-// Must match the C struct (rpc_event_t) defined in rpc_tracer.c exactly.
+// Must match the C struct (network_event_t) defined in rpc_tracer.c exactly.
 type RPCEvent struct {
-	PID          uint64
-	TimestampNs  uint64
-	ResponseSize uint64
-	MethodName   [128]byte
-	Comm         [16]byte
+	PID         uint64
+	TimestampNs uint64
+	DataLen     uint32
+	IsSend      uint32 // 1 = send (tcp_sendmsg), 0 = recv (tcp_recvmsg)
+	DestIP      uint32 // Destination IPv4 address
+	DestPort    uint16 // Destination port
+	Comm        [16]byte
+	Data        [512]byte // HTTP headers + JSON-RPC payload
 }
 
 // MonitoringFeature is the standard structure published to NATS.
@@ -97,24 +103,75 @@ func connectNATS(url string) (*nats.Conn, error) {
 	return nil, fmt.Errorf("failed to connect to NATS after multiple retries")
 }
 
-// PublishFeature serializes a feature and sends it over NATS.
-func (a *Agent) PublishFeature(f MonitoringFeature) error {
-	// 1. Construct the Subject: [AppID].[Protocol].[FeatureType]
-	subject := fmt.Sprintf("%s.%s.%s", f.AppID, f.Protocol, f.FeatureType)
+// PublishFeature sends a MonitoringFeature to NATS on the appropriate topic
+func (a *Agent) PublishFeature(feature MonitoringFeature) error {
+	// Construct the NATS subject with hierarchical structure
+	// Format: rpc.{destination}.{protocol}.{method}.{metric}
+	subject := feature.ContextHash // This now contains the full subject
 
-	// 2. Serialize Payload to JSON
-	payload, err := json.Marshal(f)
+	data, err := json.Marshal(feature)
 	if err != nil {
 		return fmt.Errorf("failed to marshal feature: %w", err)
 	}
 
-	// 3. Publish to NATS
-	if err := a.NatsConn.Publish(subject, payload); err != nil {
-		return fmt.Errorf("failed to publish to NATS subject %s: %w", subject, err)
+	if err := a.NatsConn.Publish(subject, data); err != nil {
+		return fmt.Errorf("failed to publish to subject %s: %w", subject, err)
 	}
 
-	log.Printf("Published to NATS [%s]: %s", subject, string(payload))
+	log.Printf("Published to NATS [%s]: %s", subject, string(data))
 	return nil
+}
+
+// ipToString converts uint32 IP to dotted notation
+func ipToString(ip uint32) string {
+	return fmt.Sprintf("%d.%d.%d.%d",
+		byte(ip), byte(ip>>8), byte(ip>>16), byte(ip>>24))
+}
+
+// getHostnameFromIP tries to resolve IP to hostname, returns sanitized version for NATS subject
+func getHostnameFromIP(ipStr string) string {
+	// Try reverse DNS lookup (with timeout)
+	names, err := net.LookupAddr(ipStr)
+	if err == nil && len(names) > 0 {
+		// Use first hostname, sanitize for NATS subject
+		hostname := names[0]
+		// Remove trailing dot
+		hostname = strings.TrimSuffix(hostname, ".")
+		// Replace dots and special chars with hyphens for NATS subject
+		hostname = strings.ReplaceAll(hostname, ".", "-")
+		return hostname
+	}
+	
+	// If DNS fails, use IP with hyphens
+	return strings.ReplaceAll(ipStr, ".", "-")
+}
+
+// extractETHMethodFromPayload attempts to extract eth_* method from HTTP/JSON-RPC payload
+func extractETHMethodFromPayload(payload string) string {
+	// Look for JSON-RPC method in payload
+	// Patterns: {"method":"eth_call",...} or {"jsonrpc":"2.0","method":"eth_getBalance",...}
+	
+	re := regexp.MustCompile(`"method"\s*:\s*"(eth_[a-zA-Z0-9_]+)"`)
+	matches := re.FindStringSubmatch(payload)
+	if len(matches) > 1 {
+		return matches[1]
+	}
+	
+	// Also check for HTTP POST path (some RPC endpoints use path-based routing)
+	if strings.Contains(payload, "POST /") {
+		// Look for common patterns
+		if strings.Contains(payload, "eth_call") {
+			return "eth_call"
+		}
+		if strings.Contains(payload, "eth_sendTransaction") {
+			return "eth_sendTransaction"
+		}
+		if strings.Contains(payload, "eth_getBalance") {
+			return "eth_getBalance"
+		}
+	}
+	
+	return "unknown"
 }
 
 // RunTracer initializes eBPF, attaches the probes, and starts the event loop.
@@ -131,21 +188,15 @@ func (a *Agent) RunTracer() error {
 	}
 	a.EBPFObjs = objs
 
-	log.Printf("Attaching Uprobe to symbol '%s' in binary '%s' (PID: %d)...",
-		TargetSymbolRet, TargetBinary, TargetPID)
+	log.Println("Attaching Kprobe to tcp_sendmsg...")
 
-	// Attach Uprobe to the target function's return point
-	uprobeOpts := &link.UprobeOptions{}
-	if TargetPID > 0 {
-		uprobeOpts.PID = TargetPID
-	}
-
-	up, err := link.Uprobe(TargetBinary, TargetSymbolRet, a.EBPFObjs.UprobeRpcHandleRet, uprobeOpts)
+	// Attach Kprobe to tcp_sendmsg (kernel function for sending TCP data)
+	kp, err := link.Kprobe("tcp_sendmsg", a.EBPFObjs.TraceTcpSendmsg, nil)
 	if err != nil {
-		return fmt.Errorf("failed to attach Uprobe: %w", err)
+		return fmt.Errorf("failed to attach Kprobe to tcp_sendmsg: %w", err)
 	}
-	defer up.Close()
-	log.Println("Uprobe attached successfully.")
+	defer kp.Close()
+	log.Println("Kprobe attached successfully to tcp_sendmsg")
 
 	// Start reading from the Perf Buffer
 	rd, err := perf.NewReader(a.EBPFObjs.Events, os.Getpagesize()*64)
@@ -155,6 +206,9 @@ func (a *Agent) RunTracer() error {
 	a.PerfReader = rd
 
 	log.Println("Starting Perf Buffer reader...")
+	if DebugMode {
+		log.Println("DEBUG: Debug mode enabled - verbose logging active")
+	}
 	go a.readAndProcessEvents()
 
 	// Wait for context cancellation
@@ -165,65 +219,147 @@ func (a *Agent) RunTracer() error {
 // readAndProcessEvents continuously reads raw events from the kernel and processes them.
 func (a *Agent) readAndProcessEvents() {
 	var event RPCEvent
+	eventCount := 0
 
 	for {
-		select {
-		case <-a.Ctx.Done():
-			log.Println("Event reader shut down.")
-			return
-		default:
-			// Read one record from the perf buffer
-			record, err := a.PerfReader.Read()
-			if err != nil {
-				if errors.Is(err, perf.ErrClosed) {
-					log.Println("Perf reader closed.")
-					return
-				}
-				log.Printf("Error reading perf event: %v", err)
-				continue
+		record, err := a.PerfReader.Read()
+		if err != nil {
+			if errors.Is(err, perf.ErrClosed) {
+				log.Println("Perf buffer reader closed.")
+				return
 			}
-
-			// Parse the raw data into the Go struct
-			if err := binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &event); err != nil {
-				log.Printf("Failed to parse perf event: %v", err)
-				continue
-			}
-
-			// Feature Engineering and Publishing
-			a.processAndPublishRPCEvent(event)
+			log.Printf("Error reading perf buffer: %v", err)
+			continue
 		}
+
+		if record.LostSamples > 0 {
+			log.Printf("Warning: Lost %d samples due to a full buffer", record.LostSamples)
+		}
+
+		// Parse binary data into our Go struct
+		if err := binary.Read(bytes.NewBuffer(record.RawSample), binary.LittleEndian, &event); err != nil {
+			log.Printf("Failed to parse event: %v", err)
+			continue
+		}
+
+		eventCount++
+		if DebugMode {
+			log.Printf("DEBUG: Received event #%d: PID=%d, DataLen=%d, IsSend=%d, Comm=%s",
+				eventCount, event.PID, event.DataLen, event.IsSend, 
+				string(bytes.TrimRight(event.Comm[:], "\x00")))
+		}
+
+		// Feature Engineering and Publishing
+		a.processAndPublishRPCEvent(event)
 	}
 }
 
 // processAndPublishRPCEvent performs feature extraction and sends the feature over NATS.
 func (a *Agent) processAndPublishRPCEvent(event RPCEvent) {
-	// Extract method name (null-terminated string)
-	methodName := string(bytes.TrimRight(event.MethodName[:], "\x00"))
 	processName := string(bytes.TrimRight(event.Comm[:], "\x00"))
+	
+	// Convert destination IP to string
+	destIPStr := ipToString(event.DestIP)
+	destHostname := getHostnameFromIP(destIPStr)
+	
+	// Determine direction and metric type
+	direction := "recv"
+	metricType := "response"
+	if event.IsSend == 1 {
+		direction = "send"
+		metricType = "request"
+	}
+	
+	// Try to extract ETH JSON-RPC method from payload
+	payload := string(bytes.TrimRight(event.Data[:], "\x00"))
+	ethMethod := extractETHMethodFromPayload(payload)
+	
+	// Construct hierarchical NATS subject
+	// Format: rpc.{destination}.{protocol}.{method}.{metric}
+	// Example: rpc.rpc-reya-cronos-gelato-digital.https.eth_call.request_size
+	protocol := "https"
+	if event.DestPort == 8545 || event.DestPort == 8547 {
+		protocol = "http"
+	}
+	
+	subject := fmt.Sprintf("rpc.%s.%s.%s.%s_size", 
+		destHostname, protocol, ethMethod, metricType)
+	
+	if DebugMode {
+		log.Printf("DEBUG: Processing %s to %s:%d (PID %d): method=%s, size=%d",
+			direction, destIPStr, event.DestPort, event.PID, ethMethod, event.DataLen)
+		if len(payload) > 0 && len(payload) < 200 {
+			log.Printf("DEBUG: Payload preview: %s", payload)
+		}
+	}
 
-	// Create a context hash based on method name
-	contextHash := fmt.Sprintf("method:%s", methodName)
-
-	// Create monitoring feature for response size
+	// Create monitoring feature
 	feature := MonitoringFeature{
 		AppID:       AppID,
 		Protocol:    "jsonrpc",
-		FeatureType: "response-size",
+		FeatureType: fmt.Sprintf("%s_size", metricType),
 		Timestamp:   time.Now(),
-		Value:       float64(event.ResponseSize),
-		ContextHash: contextHash,
+		Value:       float64(event.DataLen),
+		ContextHash: subject, // Full subject path
 		Details: map[string]interface{}{
-			"pid":         event.PID,
-			"process":     processName,
-			"method":      methodName,
-			"timestamp_ns": event.TimestampNs,
+			"pid":           event.PID,
+			"process":       processName,
+			"method":        ethMethod,
+			"direction":     direction,
+			"size_bytes":    event.DataLen,
+			"timestamp_ns":  event.TimestampNs,
+			"dest_ip":       destIPStr,
+			"dest_port":     event.DestPort,
+			"dest_hostname": destHostname,
 		},
 	}
 
 	// Publish to NATS
 	if err := a.PublishFeature(feature); err != nil {
-		log.Printf("Failed to publish JSON-RPC feature: %v", err)
+		log.Printf("Failed to publish RPC feature: %v", err)
+	} else if DebugMode {
+		log.Printf("DEBUG: Published to NATS [%s]: method=%s, size=%d",
+			subject, ethMethod, event.DataLen)
 	}
+}
+
+// min returns the minimum of two integers
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// extractJSONRPCMethod attempts to extract the "method" field from a JSON-RPC payload
+func extractJSONRPCMethod(payload string) string {
+	// Simple string search for "method":"xxx"
+	// More robust parsing could use json.Unmarshal
+	if len(payload) == 0 {
+		return "unknown"
+	}
+	
+	// Look for "method":"
+	methodStart := bytes.Index([]byte(payload), []byte(`"method":"`))
+	if methodStart == -1 {
+		methodStart = bytes.Index([]byte(payload), []byte(`"method": "`))
+	}
+	if methodStart == -1 {
+		return "unknown"
+	}
+	
+	// Find the start of the method value
+	valueStart := methodStart + bytes.Index([]byte(payload[methodStart:]), []byte(`"`))
+	valueStart = valueStart + bytes.Index([]byte(payload[valueStart+1:]), []byte(`"`)) + 1
+	
+	// Find the end quote
+	valueEnd := valueStart + 1 + bytes.Index([]byte(payload[valueStart+1:]), []byte(`"`))
+	
+	if valueEnd > valueStart && valueEnd < len(payload) {
+		return payload[valueStart+1 : valueEnd]
+	}
+	
+	return "unknown"
 }
 
 func main() {
