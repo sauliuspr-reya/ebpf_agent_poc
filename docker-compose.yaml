@@ -1,0 +1,65 @@
+version: '3.8'
+
+services:
+  # NATS Server for message streaming
+  nats:
+    image: nats:latest
+    container_name: nats-server
+    ports:
+      - "4222:4222"   # Client connections
+      - "8222:8222"   # HTTP monitoring
+      - "6222:6222"   # Cluster connections
+    command: ["--http_port", "8222"]
+    networks:
+      - ebpf-net
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8222/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # NATS Subscriber for viewing messages
+  nats-subscriber:
+    build:
+      context: .
+      dockerfile: Dockerfile.subscriber
+    container_name: nats-subscriber
+    depends_on:
+      nats:
+        condition: service_healthy
+    environment:
+      - NATS_URL=nats://nats:4222
+    networks:
+      - ebpf-net
+    restart: unless-stopped
+
+  # eBPF Agent (requires privileged mode and host access)
+  # Note: This will only work on Linux hosts
+  ebpf-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ebpf-agent
+    privileged: true
+    network_mode: host
+    pid: host
+    depends_on:
+      nats:
+        condition: service_healthy
+    environment:
+      - NATS_URL=nats://localhost:4222
+      - APP_ID=arbitrum-node-local
+      - TARGET_BINARY=/usr/local/bin/geth
+      - TARGET_SYMBOL=github.com/ethereum/go-ethereum/rpc.(*Server).serveRequest
+      - TARGET_PID=0
+    volumes:
+      - /sys/kernel/debug:/sys/kernel/debug:ro
+      - /proc:/host/proc:ro
+      - /sys/fs/bpf:/sys/fs/bpf
+    restart: unless-stopped
+    # Uncomment on Linux hosts only
+    # If running on macOS, this container will fail
+
+networks:
+  ebpf-net:
+    driver: bridge

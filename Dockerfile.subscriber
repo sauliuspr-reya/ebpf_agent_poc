@@ -1,0 +1,14 @@
+# Simple Dockerfile for the NATS subscriber
+FROM golang:1.21-alpine AS builder
+
+WORKDIR /build
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY nats_subscriber_example.go ./
+RUN go build -o nats-subscriber nats_subscriber_example.go
+
+FROM alpine:latest
+RUN apk --no-cache add ca-certificates
+COPY --from=builder /build/nats-subscriber /usr/local/bin/
+ENTRYPOINT ["/usr/local/bin/nats-subscriber"]
